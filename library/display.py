@@ -27,6 +27,8 @@ from library.lcd.lcd_comm_rev_d import LcdCommRevD
 from library.lcd.lcd_comm_weact_a import LcdCommWeActA
 from library.lcd.lcd_comm_weact_b import LcdCommWeActB
 from library.lcd.lcd_simulated import LcdSimulated
+from library.lcd.lcd_comm_racer import LcdCommRacer
+from library.knob_brightness import KnobBrightness
 from library.log import logger
 
 
@@ -74,6 +76,8 @@ def _get_theme_size() -> tuple[int, int]:
 class Display:
     def __init__(self):
         self.lcd = None
+        self._knob = None      # KnobBrightness for Racer displays
+        self._knob_timer = None
         width, height = _get_theme_size()
         if config.CONFIG_DATA["display"]["REVISION"] == "A":
             self.lcd = LcdCommRevA(com_port=config.CONFIG_DATA['config']['COM_PORT'],
@@ -97,6 +101,9 @@ class Display:
         elif config.CONFIG_DATA["display"]["REVISION"] == "SIMU":
             # Simulated display: always set width/height from theme
             self.lcd = LcdSimulated(display_width=width, display_height=height)
+        elif config.CONFIG_DATA["display"]["REVISION"] == "RACER":
+            # Racer USB display: direct USB communication
+            self.lcd = LcdCommRacer(display_width=width, display_height=height)
         else:
             logger.error("Unknown display revision '", config.CONFIG_DATA["display"]["REVISION"], "'")
 
@@ -121,18 +128,61 @@ class Display:
         # Turn screen on in case it was turned off previously
         self.lcd.ScreenOn()
 
-        # Set brightness
-        self.lcd.SetBrightness(config.CONFIG_DATA["display"]["BRIGHTNESS"])
+        # For Racer: start knob thread first so its default (70%) is used
+        if config.CONFIG_DATA["display"]["REVISION"] == "RACER":
+            self._start_knob_brightness()
+
+        # Set brightness — use knob value if available, otherwise config
+        if self._knob is not None:
+            self.lcd.SetBrightness(self._knob.brightness)
+        else:
+            self.lcd.SetBrightness(config.CONFIG_DATA["display"]["BRIGHTNESS"])
 
         # Set backplate RGB LED color (for supported HW only)
         self.lcd.SetBackplateLedColor(config.THEME_DATA['display'].get("DISPLAY_RGB_LED", (255, 255, 255)))
 
     def turn_off(self):
+        # Stop knob brightness thread
+        self._stop_knob_brightness()
+
         # Turn screen off
         self.lcd.ScreenOff()
 
         # Turn off backplate RGB LED
         self.lcd.SetBackplateLedColor(led_color=(0, 0, 0))
+
+    # ── Knob brightness helpers ────────────────────────────────────────
+
+    def _start_knob_brightness(self):
+        """Start the volume-knob reader and a polling timer."""
+        if self._knob is not None:
+            return
+        self._knob = KnobBrightness()
+        if self._knob.start():
+            self._poll_knob_brightness()
+        else:
+            self._knob = None
+
+    def _poll_knob_brightness(self):
+        """Check if the knob changed brightness and push it to the LCD."""
+        import threading
+        if self._knob is None:
+            return
+        level = self._knob.brightness
+        self.lcd.SetBrightness(level)
+        # Re-schedule every 500 ms
+        self._knob_timer = threading.Timer(0.5, self._poll_knob_brightness)
+        self._knob_timer.daemon = True
+        self._knob_timer.start()
+
+    def _stop_knob_brightness(self):
+        """Stop the polling timer and knob thread."""
+        if self._knob_timer is not None:
+            self._knob_timer.cancel()
+            self._knob_timer = None
+        if self._knob is not None:
+            self._knob.stop()
+            self._knob = None
 
     def display_static_images(self):
         if config.THEME_DATA.get('static_images', False):
