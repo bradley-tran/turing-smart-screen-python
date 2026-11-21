@@ -62,11 +62,6 @@ Or the troubleshooting page: https://github.com/mathoudebine/turing-smart-screen
     except:
         os._exit(0)
 
-try:
-    import pystray
-except:
-    # If pystray cannot be loaded do not stop the program, just ignore it. The tray icon will not be displayed.
-    pass
 
 MAIN_DIRECTORY = str(Path(__file__).parent.resolve()) + "/"
 
@@ -89,7 +84,7 @@ if __name__ == "__main__":
 
         logger.debug("(Waited %.1fs)" % wait_time)
 
-    def clean_stop(tray_icon=None):
+    def clean_stop():
         # Turn screen and LEDs off before stopping
         display.turn_off()
 
@@ -99,10 +94,6 @@ if __name__ == "__main__":
 
         # Waiting for all pending request to be sent to display
         wait_for_empty_queue(5)
-
-        # Remove tray icon just before exit
-        if tray_icon:
-            tray_icon.visible = False
 
         # We force the exit to avoid waiting for other scheduled tasks: they may have a long delay!
         try:
@@ -116,20 +107,25 @@ if __name__ == "__main__":
         clean_stop()
 
 
-    def on_configure_tray(tray_icon, item):
-        logger.info("Configure from tray icon")
-        subprocess.Popen(f'"{MAIN_DIRECTORY}{glob.glob("configure.*", root_dir=MAIN_DIRECTORY)[0]}"', shell=True)
-        clean_stop(tray_icon)
-
-
-    def on_exit_tray(tray_icon, item):
-        logger.info("Exit from tray icon")
-        clean_stop(tray_icon)
+    def on_sigusr1_restart(signum, frame=None):
+        """Handle SIGUSR1 from tray_themes.py: clean restart to apply new theme."""
+        logger.info("Caught SIGUSR1, restarting to apply theme change...")
+        scheduler.STOPPING = True
+        try:
+            display.turn_off()
+        except Exception:
+            pass
+        try:
+            display.lcd.closeSerial()
+        except Exception:
+            pass
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
     def on_clean_exit(*args):
         logger.info("Program will now exit")
         clean_stop()
+
 
 
     if platform.system() == "Windows":
@@ -160,31 +156,6 @@ if __name__ == "__main__":
                 logger.info("Program will now exit")
                 clean_stop()
 
-    # Create a tray icon for the program, with an Exit entry in menu
-    try:
-        tray_icon = pystray.Icon(
-            name='Turing System Monitor',
-            title='Turing System Monitor',
-            icon=Image.open(MAIN_DIRECTORY + "res/icons/monitor-icon-17865/64.png"),
-            menu=pystray.Menu(
-                pystray.MenuItem(
-                    text='Configure',
-                    action=on_configure_tray),
-                pystray.Menu.SEPARATOR,
-                pystray.MenuItem(
-                    text='Exit',
-                    action=on_exit_tray)
-            )
-        )
-
-        # For platforms != macOS, display the tray icon now with non-blocking function
-        if platform.system() != "Darwin":
-            tray_icon.run_detached()
-            logger.info("Tray icon has been displayed")
-    except:
-        tray_icon = None
-        logger.warning("Tray icon is not supported on your platform")
-
     # Set the different stopping event handlers, to send a complete frame to the LCD before exit
     atexit.register(on_clean_exit)
     signal.signal(signal.SIGINT, on_signal_caught)
@@ -192,8 +163,62 @@ if __name__ == "__main__":
     is_posix = os.name == 'posix'
     if is_posix:
         signal.signal(signal.SIGQUIT, on_signal_caught)
+        signal.signal(signal.SIGUSR1, on_sigusr1_restart)
     if platform.system() == "Windows":
         win32api.SetConsoleCtrlHandler(on_win32_ctrl_event, True)
+
+    tray_icon = None  # Tray icon is handled by separate tray_themes.py subprocess
+
+    # Auto-launch tray_themes.py as the regular user (so D-Bus/AppIndicator works)
+    if is_posix and os.getuid() == 0 and os.environ.get('SUDO_UID'):
+        import threading
+        tray_script = os.path.join(MAIN_DIRECTORY, 'tray_themes.py')
+        if os.path.isfile(tray_script):
+            try:
+                sudo_uid = int(os.environ['SUDO_UID'])
+                sudo_gid = int(os.environ.get('SUDO_GID', sudo_uid))
+                r_fd, w_fd = os.pipe()
+
+                def _drop_privs():
+                    os.setgid(sudo_gid)
+                    os.setuid(sudo_uid)
+
+                env = os.environ.copy()
+                env['TRAY_RESTART_FD'] = str(w_fd)
+                env['DBUS_SESSION_BUS_ADDRESS'] = 'unix:path=/run/user/%d/bus' % sudo_uid
+                # Add venv site-packages so system python can find pystray/PIL/yaml
+                venv_site = os.path.join(
+                    MAIN_DIRECTORY, '.venv', 'lib',
+                    'python%d.%d' % (sys.version_info.major, sys.version_info.minor),
+                    'site-packages')
+                env['PYTHONPATH'] = venv_site
+                # Remove SUDO vars so tray_themes doesn't think it's root
+                for k in ('SUDO_UID', 'SUDO_GID', 'SUDO_USER', 'SUDO_COMMAND'):
+                    env.pop(k, None)
+
+                # Use system python (has gi/AppIndicator) instead of venv python
+                system_python = '/usr/bin/python3'
+                subprocess.Popen(
+                    [system_python, tray_script],
+                    preexec_fn=_drop_privs,
+                    pass_fds=(w_fd,),
+                    env=env,
+                )
+                os.close(w_fd)  # Close write end in parent
+
+                def _watch_tray_pipe():
+                    try:
+                        data = os.read(r_fd, 1024)
+                        if data:
+                            logger.info("Tray requested restart: %s" % data.decode().strip())
+                            on_sigusr1_restart(None, None)
+                    except OSError:
+                        pass
+
+                threading.Thread(target=_watch_tray_pipe, daemon=True).start()
+                logger.info("Tray theme switcher launched (UID %d)" % sudo_uid)
+            except Exception as e:
+                logger.warning("Could not launch tray theme switcher: %s" % e)
 
     # Initialize the display
     logger.info("Initialize display")
